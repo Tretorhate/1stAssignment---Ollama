@@ -5,13 +5,12 @@ import bs4
 import time
 from llama_index.core.llms import ChatMessage
 from llama_index.llms.ollama import Ollama
-from langchain_community.document_loaders import WebBaseLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.embeddings import OllamaEmbeddings
-# from langchain_chroma import Chroma
-# from langchain_ollama.llms import OllamaLLM
 from langchain_community.vectorstores import Chroma
-# from langchain_community.llms import OllamaLLM
+import tempfile
+from llama_index.core import Document
+from langchain_core.documents import Document
 
 logging.basicConfig(level=logging.INFO)
 
@@ -21,50 +20,61 @@ if 'messages' not in st.session_state:
 if 'vectorstore' not in st.session_state:
     st.session_state.vectorstore = None
 
-def load_and_process_url(url, class_name=None):
-    max_retries = 3
-    retry_delay = 1  # in seconds
+def process_text_for_context(text):
+    """Process input text into a vectorstore for context."""
+    try:
+        # Split text into chunks using the text splitter
+        text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=1200,
+            chunk_overlap=100,
+            add_start_index=True
+        )
+        
+        # Split the raw text
+        splits = text_splitter.split_text(text)
+        
+        if not splits:
+            raise ValueError("No text chunks were created")
 
-    for attempt in range(max_retries):
-        try:
-            # Configure BeautifulSoup strainer if class name is provided
-            bs4_strainer = bs4.SoupStrainer(class_=(class_name,)) if class_name else None
-            loader_kwargs = {"bs_kwargs": {"parse_only": bs4_strainer}} if bs4_strainer else {}
-            
-            # Load the webpage
-            loader = WebBaseLoader(web_paths=(url,), **loader_kwargs)
-            docs = loader.load()
-            
-            # Split the text into chunks
-            text_splitter = RecursiveCharacterTextSplitter(
-                chunk_size=1200,
-                chunk_overlap=100,
-                add_start_index=True
-            )
-            splits = text_splitter.split_documents(docs)
-            
-            # Create embeddings and vectorstore
-            embeddings = OllamaEmbeddings(model="all-minilm") # llama3.2 all-minilm
-            vectorstore = Chroma.from_documents(documents=splits, embedding=embeddings)
-            
-            return vectorstore
-        except Exception as e:
-            if attempt < max_retries - 1:
-                logging.warning(f"Attempt {attempt+1} failed with error: {str(e)}. Retrying in {retry_delay} seconds...")
-                time.sleep(retry_delay)
-            else:
-                logging.error(f"All retries failed with error: {str(e)}")
-                raise e
+        # Create proper Langchain Document objects
+        documents = [
+            Document(page_content=chunk, metadata={}) 
+            for chunk in splits
+        ]
+        
+        # Update the import for OllamaEmbeddings based on deprecation warning
+        from langchain_ollama import OllamaEmbeddings
+        
+        # Initialize embeddings and vectorstore
+        embeddings = OllamaEmbeddings(model="all-minilm")
+        vectorstore = Chroma.from_documents(
+            documents=documents,  # Now passing proper Document objects
+            embedding=embeddings,
+            persist_directory=tempfile.mkdtemp()
+        )
+        
+        logging.info(f"Successfully created vectorstore with {len(documents)} chunks")
+        return vectorstore
+    except Exception as e:
+        logging.error(f"Error processing text: {str(e)}")
+        raise
+
 
 def get_context_from_vectorstore(vectorstore, question, k=3):
     """Retrieve relevant context from the vector store."""
     try:
         retriever = vectorstore.as_retriever(search_type="similarity", search_kwargs={"k": k})
         retrieved_docs = retriever.invoke(question)
-        return ' '.join([doc.page_content for doc in retrieved_docs])
+        
+        # Ensure the 'text' attribute exists
+        return ' '.join([getattr(doc, 'text', '') for doc in retrieved_docs if hasattr(doc, 'text')])
     except Exception as e:
         logging.error(f"Error retrieving context: {str(e)}")
         return ""
+
+
+
+
 
 def stream_chat(model, messages, context=None):
     """Stream chat responses with optional context enhancement."""
@@ -98,17 +108,24 @@ def main():
 
     # Sidebar configurations
     model = st.sidebar.selectbox("Choose a model", ["llama3.2"])
-    url = st.sidebar.text_input("Enter URL for context (optional)")
-    class_name = st.sidebar.text_input("Enter class name for web scraping (optional)")
     
-    # Load URL data if provided
-    if url and st.sidebar.button("Load URL"):
-        with st.spinner("Processing URL..."):
+    # Add text input for context
+    context_text = st.sidebar.text_area(
+        "Enter context information",
+        placeholder="Paste your context text here...",
+        height=300
+    )
+    
+    # Process context button
+    if context_text and st.sidebar.button("Process Context"):
+        logging.info("Processing new context text")
+        with st.spinner("Processing context..."):
             try:
-                st.session_state.vectorstore = load_and_process_url(url, class_name)
-                st.success("URL processed successfully!")
+                st.session_state.vectorstore = process_text_for_context(context_text)
+                st.success("Context processed successfully!")
             except Exception as e:
-                st.error(f"Error processing URL: {str(e)}")
+                st.error(f"Error processing context: {str(e)}")
+                logging.error(f"Context processing error: {str(e)}")
 
     # Chat interface
     if prompt := st.chat_input("Your question"):
