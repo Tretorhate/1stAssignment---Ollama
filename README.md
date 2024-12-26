@@ -47,9 +47,11 @@ Ensure you have the following installed on your system:
 
 4. Run the application:
    ```bash
-   streamlit run app.py
+   streamlit run src/app.py
    ollama run llama3.2
    ```
+   ![Streamlit application running in the terminal](images/streamlit_run.png)
+   ![Ollama application running in the terminal](images/ollama_run.png)
 
 ---
 
@@ -83,20 +85,27 @@ Ensure you have the following installed on your system:
    > What is the capital of France?
 
 2. Receive a response from the LLM:
+
    > The capital of France is Paris.
+
+   ![France is Paris question response](images/france.png)
 
 ### Example 2: Context-Aware Question
 
 1. Paste the following context in the "Context Management" section:
 
    > Python is a programming language known for its simplicity and readability. It is widely used in web development, data analysis, artificial intelligence, and more.
+   > ![Python related context enter](images/python_context.png)
 
 2. Enter a question:
 
    > What is Python used for?
 
 3. Receive a contextually enhanced response:
+
    > Based on the provided context, Python is used for web development, data analysis, artificial intelligence, and more.
+
+   ![Python context answer](images/python_context_answer.png)
 
 ### Example 3: Restoring a Previous Session
 
@@ -109,6 +118,7 @@ Ensure you have the following installed on your system:
 
 - **Chat History:** Stored persistently in the `chat_data/chat_history` directory.
 - **Context Data:** Managed in the `chat_data/context` directory.
+  ![History showcase](images/history_usage.png)
 
 ---
 
