@@ -45,6 +45,104 @@ if 'context_client' not in st.session_state:
 if 'current_session_id' not in st.session_state:
     st.session_state.current_session_id = None
 
+# Add new constant for uploaded files
+UPLOADS_DIR = os.path.join(os.getcwd(), "uploaded_files")
+os.makedirs(UPLOADS_DIR, exist_ok=True)
+
+# Initialize additional session state variables for file handling
+if 'uploaded_files' not in st.session_state:
+    st.session_state.uploaded_files = []
+if 'document_store' not in st.session_state:
+    st.session_state.document_store = None
+
+def save_uploaded_file(uploaded_file):
+    """Save uploaded file and return the file path."""
+    try:
+        file_path = os.path.join(UPLOADS_DIR, uploaded_file.name)
+        with open(file_path, "wb") as f:
+            f.write(uploaded_file.getbuffer())
+        return file_path
+    except Exception as e:
+        logging.error(f"Error saving uploaded file: {str(e)}")
+        raise
+
+def process_uploaded_files(files):
+    """Process multiple uploaded files and store them in ChromaDB."""
+    try:
+        # Initialize document store if not exists
+        client = PersistentClient(path=os.path.join(UPLOADS_DIR, "document_store"))
+        try:
+            collection = client.get_collection(name="document_store")
+            # Clear existing documents
+            collection.delete(where={})
+        except InvalidCollectionException:
+            collection = client.create_collection(
+                name="document_store",
+                metadata={"hnsw:space": "cosine"}
+            )
+
+        text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=1200,
+            chunk_overlap=100,
+            add_start_index=True
+        )
+
+        all_chunks = []
+        for uploaded_file in files:
+            if uploaded_file.type == "text/plain":
+                # Save file and read content
+                file_path = save_uploaded_file(uploaded_file)
+                with open(file_path, 'r') as f:
+                    content = f.read()
+                
+                # Split content into chunks
+                chunks = text_splitter.split_text(content)
+                
+                # Process each chunk
+                for i, chunk in enumerate(chunks):
+                    embedding = st.session_state.embeddings.embed_query(chunk)
+                    metadata = {
+                        'source': uploaded_file.name,
+                        'chunk_id': i,
+                        'type': 'document'
+                    }
+                    collection.add(
+                        documents=[chunk],
+                        embeddings=[embedding],
+                        metadatas=[metadata],
+                        ids=[f"doc_{uploaded_file.name}_{i}"]
+                    )
+
+        st.session_state.document_store = collection
+        return len(files)
+    except Exception as e:
+        logging.error(f"Error processing uploaded files: {str(e)}")
+        raise
+
+def get_relevant_document_context(question, k=3):
+    """Retrieve relevant context from uploaded documents."""
+    try:
+        if not st.session_state.document_store:
+            return ""
+
+        query_embedding = st.session_state.embeddings.embed_query(question)
+        results = st.session_state.document_store.query(
+            query_embeddings=[query_embedding],
+            n_results=k,
+            where={"type": "document"}
+        )
+
+        if results and 'documents' in results and results['documents']:
+            # Include source information in context
+            contexts = []
+            for doc, metadata in zip(results['documents'][0], results['metadatas'][0]):
+                source = metadata.get('source', 'Unknown')
+                contexts.append(f"From {source}:\n{doc}")
+            return '\n\n'.join(contexts)
+        return ""
+    except Exception as e:
+        logging.error(f"Error retrieving document context: {str(e)}")
+        return ""
 def migrate_chat_history(collection):
     """Migrate existing chat history to include session IDs."""
     try:
@@ -345,7 +443,7 @@ def main():
     st.title("Enhanced Chat with LLMs")
     logging.info("App started")
 
-    # Initialize chat history store if not exists
+    # Initialize stores if not exists
     if st.session_state.chat_vectorstore is None:
         try:
             client, collection = initialize_chat_history_store()
@@ -358,80 +456,70 @@ def main():
     # Sidebar configurations
     st.sidebar.title("Settings")
     model = st.sidebar.selectbox("Choose a model", ["llama3.2"])
-    
-    # Add clear chat history button
-    if st.sidebar.button("Clear Chat History"):
-        clear_chat_history()
-    
-    # Context input
-    st.sidebar.title("Context Management")
-    context_text = st.sidebar.text_area(
-        "Enter context information",
-        placeholder="Paste your context text here...",
-        height=300
+
+    # File upload section in sidebar
+    st.sidebar.title("Document Upload")
+    uploaded_files = st.sidebar.file_uploader(
+        "Upload text documents",
+        type=['txt'],
+        accept_multiple_files=True
     )
-    
-    if context_text and st.sidebar.button("Process Context"):
-        logging.info("Processing new context text")
-        with st.spinner("Processing context..."):
-            try:
-                client, collection = process_text_for_context(context_text)
-                st.session_state.context_client = client
-                st.session_state.vectorstore = collection
-                st.success("Context processed successfully!")
-            except Exception as e:
-                st.error(f"Error processing context: {str(e)}")
-                logging.error(f"Context processing error: {str(e)}")
 
-    # Display storage location information
-    st.sidebar.title("Storage Information")
-    st.sidebar.info(f"""
-    Data Storage Locations:
-    - Chat History: {CHAT_HISTORY_DIR}
-    - Context Data: {CONTEXT_DIR}
-    """)
+    if uploaded_files:
+        if st.sidebar.button("Process Documents"):
+            with st.spinner("Processing documents..."):
+                try:
+                    num_files = process_uploaded_files(uploaded_files)
+                    st.success(f"Successfully processed {num_files} documents!")
+                except Exception as e:
+                    st.error(f"Error processing documents: {str(e)}")
 
-    # Display previous conversation sessions in the sidebar
-# In the main() function, replace the previous conversation display section with this:
+    # Display uploaded files
+    if st.session_state.document_store:
+        st.sidebar.title("Uploaded Documents")
+        try:
+            results = st.session_state.document_store.get(
+                where={"type": "document"},
+                include=["metadatas"]
+            )
+            if results and results['metadatas']:
+                unique_sources = set(meta['source'] for meta in results['metadatas'])
+                st.sidebar.write("Available documents:")
+                for source in unique_sources:
+                    st.sidebar.text(f"📄 {source}")
+        except Exception as e:
+            st.sidebar.error(f"Error displaying documents: {str(e)}")
 
-    # Display previous conversation sessions in the sidebar
+    # Display previous conversation sessions
     st.sidebar.title("Previous Conversations")
     if st.session_state.chat_vectorstore is not None:
         chat_sessions = get_chat_sessions(st.session_state.chat_vectorstore)
         
-        # Create a container for better organization
         session_container = st.sidebar.container()
         
-        # Add "New Chat" button at the top
         if session_container.button("Start New Chat", key="new_chat"):
             st.session_state.messages = []
             st.session_state.current_session_id = None
             st.rerun()
         
-        # Add separator
         session_container.markdown("---")
         
         for session_id, session_data in chat_sessions:
             try:
-                # Format timestamp for display
                 timestamp = datetime.fromisoformat(session_data['first_timestamp'])
                 formatted_time = timestamp.strftime("%Y-%m-%d %H:%M")
                 
-                # Get first message preview
                 preview = ""
                 if session_data['messages']:
                     first_message = session_data['messages'][0]
-                    # Extract just the question part for preview
                     if "Q: " in first_message:
                         preview = first_message.split("Q: ")[1].split("\nA:")[0]
                         if len(preview) > 30:
                             preview = preview[:30] + "..."
                 
-                # Create a unique key using session_id
                 button_key = f"session_{session_id}"
                 button_label = f"{formatted_time}\n{preview}"
                 
-                # Create button with unique key
                 if session_container.button(
                     button_label,
                     key=button_key,
@@ -445,11 +533,11 @@ def main():
             except Exception as e:
                 logging.error(f"Error displaying session {session_id}: {str(e)}")
                 continue
-            
-        # Add clear history button at the bottom
+        
         session_container.markdown("---")
         if session_container.button("Clear All History", key="clear_history"):
             clear_chat_history()
+
     # Chat interface
     if prompt := st.chat_input("Your question"):
         st.session_state.messages.append({"role": "user", "content": prompt})
@@ -468,19 +556,29 @@ def main():
 
                 with st.spinner("Writing..."):
                     try:
-                        # Get context from knowledge base
-                        knowledge_context = ""
+                        # Combine context from knowledge base and uploaded documents
+                        context = []
+                        
                         if st.session_state.vectorstore is not None:
-                            knowledge_context = get_context_from_collection(
+                            kb_context = get_context_from_collection(
                                 st.session_state.vectorstore,
                                 st.session_state.context_embeddings,
                                 prompt
                             )
+                            if kb_context:
+                                context.append(kb_context)
                         
+                        # Get context from uploaded documents
+                        doc_context = get_relevant_document_context(prompt)
+                        if doc_context:
+                            context.append(doc_context)
+                        
+                        combined_context = "\n\n".join(context)
+
                         # Generate response
                         messages = [ChatMessage(role=msg["role"], content=msg["content"]) 
                                   for msg in st.session_state.messages]
-                        response_message = stream_chat(model, messages, knowledge_context)
+                        response_message = stream_chat(model, messages, combined_context)
                         
                         # Store the interaction in chat history
                         session_id = store_chat_interaction(
@@ -491,11 +589,9 @@ def main():
                             session_id=st.session_state.current_session_id
                         )
                         
-                        # Update current session ID if this is a new conversation
                         if st.session_state.current_session_id is None:
                             st.session_state.current_session_id = session_id
                         
-                        # Calculate and display duration
                         duration = time.time() - start_time
                         response_message_with_duration = f"{response_message}\n\nDuration: {duration:.2f} seconds"
                         st.session_state.messages.append({"role": "assistant", "content": response_message_with_duration})
