@@ -1,5 +1,7 @@
 # Enhanced Chat with LLMs
 
+Done by Arman Mursalimov and Yerassyl Sagi - it-2301
+
 ## Overview
 
 This project provides a web-based interface for enhanced interactions with Large Language Models (LLMs). It leverages the power of ChromaDB for persistent chat history and context management, and integrates Ollama for LLM embeddings and responses.
