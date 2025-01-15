@@ -1,8 +1,12 @@
 import streamlit as st
 import logging
 import time
-import bs4
 import os
+import uuid
+from datetime import datetime
+import requests
+from bs4 import BeautifulSoup
+import shutil
 from llama_index.core.llms import ChatMessage
 from llama_index.llms.ollama import Ollama
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -10,53 +14,42 @@ from langchain_ollama import OllamaEmbeddings
 import chromadb
 from chromadb import PersistentClient
 from chromadb.errors import InvalidCollectionException
-import tempfile
-from langchain_core.documents import Document
-import uuid
-from datetime import datetime
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 
-# Create persistent storage directories
-STORAGE_DIR = os.path.join(os.getcwd(), "chat_data")
+# Create storage directories
+STORAGE_DIR = os.path.join(os.getcwd(), "ai_assistant_data")
 CHAT_HISTORY_DIR = os.path.join(STORAGE_DIR, "chat_history")
 CONTEXT_DIR = os.path.join(STORAGE_DIR, "context")
+UPLOADS_DIR = os.path.join(os.getcwd(), "uploaded_files")
 
-# Create directories if they don't exist
+# Create directories
 os.makedirs(CHAT_HISTORY_DIR, exist_ok=True)
 os.makedirs(CONTEXT_DIR, exist_ok=True)
-
-# Initialize all session state variables
-if 'messages' not in st.session_state:
-    st.session_state.messages = []
-if 'vectorstore' not in st.session_state:
-    st.session_state.vectorstore = None
-if 'chat_vectorstore' not in st.session_state:
-    st.session_state.chat_vectorstore = None
-if 'chroma_client' not in st.session_state:
-    st.session_state.chroma_client = None
-if 'embeddings' not in st.session_state:
-    st.session_state.embeddings = OllamaEmbeddings(model="all-minilm")
-if 'context_embeddings' not in st.session_state:
-    st.session_state.context_embeddings = OllamaEmbeddings(model="all-minilm")
-if 'context_client' not in st.session_state:
-    st.session_state.context_client = None
-if 'current_session_id' not in st.session_state:
-    st.session_state.current_session_id = None
-
-# Add new constant for uploaded files
-UPLOADS_DIR = os.path.join(os.getcwd(), "uploaded_files")
 os.makedirs(UPLOADS_DIR, exist_ok=True)
 
-# Initialize additional session state variables for file handling
-if 'uploaded_files' not in st.session_state:
-    st.session_state.uploaded_files = []
+# Initialize session state
+if 'messages' not in st.session_state:
+    st.session_state.messages = []
+if 'chat_vectorstore' not in st.session_state:
+    st.session_state.chat_vectorstore = None
 if 'document_store' not in st.session_state:
     st.session_state.document_store = None
+if 'constitution_store' not in st.session_state:
+    st.session_state.constitution_store = None
+if 'embeddings' not in st.session_state:
+    st.session_state.embeddings = OllamaEmbeddings(model="all-minilm")
+if 'current_session_id' not in st.session_state:
+    st.session_state.current_session_id = None
+if 'assistant_mode' not in st.session_state:
+    st.session_state.assistant_mode = "general"
+if 'constitution_loaded' not in st.session_state:
+    st.session_state.constitution_loaded = False
+
+# Helper functions
 
 def save_uploaded_file(uploaded_file):
-    """Save uploaded file and return the file path."""
     try:
         file_path = os.path.join(UPLOADS_DIR, uploaded_file.name)
         with open(file_path, "wb") as f:
@@ -67,13 +60,10 @@ def save_uploaded_file(uploaded_file):
         raise
 
 def process_uploaded_files(files):
-    """Process multiple uploaded files and store them in ChromaDB."""
     try:
-        # Initialize document store if not exists
         client = PersistentClient(path=os.path.join(UPLOADS_DIR, "document_store"))
         try:
             collection = client.get_collection(name="document_store")
-            # Clear existing documents
             collection.delete(where={})
         except InvalidCollectionException:
             collection = client.create_collection(
@@ -87,18 +77,14 @@ def process_uploaded_files(files):
             add_start_index=True
         )
 
-        all_chunks = []
         for uploaded_file in files:
             if uploaded_file.type == "text/plain":
-                # Save file and read content
                 file_path = save_uploaded_file(uploaded_file)
                 with open(file_path, 'r') as f:
                     content = f.read()
                 
-                # Split content into chunks
                 chunks = text_splitter.split_text(content)
                 
-                # Process each chunk
                 for i, chunk in enumerate(chunks):
                     embedding = st.session_state.embeddings.embed_query(chunk)
                     metadata = {
@@ -120,7 +106,6 @@ def process_uploaded_files(files):
         raise
 
 def get_relevant_document_context(question, k=3):
-    """Retrieve relevant context from uploaded documents."""
     try:
         if not st.session_state.document_store:
             return ""
@@ -133,7 +118,6 @@ def get_relevant_document_context(question, k=3):
         )
 
         if results and 'documents' in results and results['documents']:
-            # Include source information in context
             contexts = []
             for doc, metadata in zip(results['documents'][0], results['metadatas'][0]):
                 source = metadata.get('source', 'Unknown')
@@ -143,84 +127,13 @@ def get_relevant_document_context(question, k=3):
     except Exception as e:
         logging.error(f"Error retrieving document context: {str(e)}")
         return ""
-def migrate_chat_history(collection):
-    """Migrate existing chat history to include session IDs."""
-    try:
-        # Get all existing documents and metadata
-        results = collection.get(include=["documents", "metadatas"])
-        
-        if not results or not results['documents']:
-            return
-        
-        # Retrieve document IDs separately
-        document_ids = results.get('ids', [str(uuid.uuid4()) for _ in results['documents']])
-        
-        # Group messages created close in time (within 1 hour)
-        current_time = None
-        current_session = None
-        updates = []
-        
-        for doc, metadata, doc_id in zip(results['documents'], results['metadatas'], document_ids):
-            # Skip if already has session_id
-            if metadata.get('session_id'):
-                continue
-            
-            timestamp = metadata.get('timestamp')
-            if not timestamp:
-                timestamp = datetime.now().isoformat()
-            
-            try:
-                msg_time = datetime.fromisoformat(timestamp)
-                
-                # Start new session if more than 1 hour gap or first message
-                if (not current_time or 
-                    not current_session or 
-                    (msg_time - current_time).total_seconds() > 3600):
-                    current_session = str(uuid.uuid4())
-                    current_time = msg_time
-                
-                # Update metadata
-                new_metadata = {
-                    **metadata,
-                    'session_id': current_session,
-                    'type': 'chat_history',
-                    'message_type': 'qa_pair'
-                }
-                
-                updates.append({
-                    'id': doc_id,
-                    'metadata': new_metadata
-                })
-                
-            except (ValueError, TypeError) as e:
-                logging.warning(f"Error processing timestamp for document {doc_id}: {str(e)}")
-                continue
-        
-        # Update documents in batches
-        batch_size = 100
-        for i in range(0, len(updates), batch_size):
-            batch = updates[i:i + batch_size]
-            collection.update(
-                ids=[u['id'] for u in batch],
-                metadatas=[u['metadata'] for u in batch]
-            )
-            
-        logging.info(f"Successfully migrated {len(updates)} chat history entries")
-        
-    except Exception as e:
-        logging.error(f"Error during chat history migration: {str(e)}")
 
 def initialize_chat_history_store():
-    """Initialize ChromaDB for chat history with migration support."""
     try:
         client = PersistentClient(path=CHAT_HISTORY_DIR)
-        collection = None
-        
         try:
             collection = client.get_collection(name="chat_history")
             logging.info("Retrieved existing chat history collection")
-            # Migrate existing data if needed
-            migrate_chat_history(collection)
         except InvalidCollectionException:
             collection = client.create_collection(
                 name="chat_history",
@@ -234,7 +147,6 @@ def initialize_chat_history_store():
         raise
 
 def store_chat_interaction(collection, embeddings, question, answer, session_id=None):
-    """Store a chat interaction in ChromaDB with session tracking."""
     try:
         if session_id is None:
             session_id = str(uuid.uuid4())
@@ -242,7 +154,6 @@ def store_chat_interaction(collection, embeddings, question, answer, session_id=
         chat_content = f"Q: {question}\nA: {answer}"
         embedding = embeddings.embed_query(chat_content)
         
-        # Ensure timestamp is in ISO format
         current_time = datetime.now().isoformat()
         
         metadata = {
@@ -250,7 +161,7 @@ def store_chat_interaction(collection, embeddings, question, answer, session_id=
             'interaction_id': str(uuid.uuid4()),
             'session_id': session_id,
             'type': 'chat_history',
-            'message_type': 'qa_pair'  # Add additional metadata for better filtering
+            'message_type': 'qa_pair'
         }
         
         collection.add(
@@ -265,7 +176,6 @@ def store_chat_interaction(collection, embeddings, question, answer, session_id=
         raise
 
 def get_chat_sessions(collection):
-    """Retrieve all unique chat sessions from ChromaDB collection."""
     try:
         if not collection:
             return []
@@ -277,7 +187,7 @@ def get_chat_sessions(collection):
 
         sessions = {}
         for doc, metadata in zip(results['documents'], results['metadatas']):
-            session_id = metadata.get('session_id', str(uuid.uuid4()))  # Fallback to a new session ID
+            session_id = metadata.get('session_id', str(uuid.uuid4()))
             timestamp = metadata.get('timestamp', datetime.now().isoformat())
 
             if session_id not in sessions:
@@ -297,7 +207,6 @@ def get_chat_sessions(collection):
             except ValueError:
                 continue
 
-        # Sort sessions by last timestamp
         try:
             sorted_sessions = sorted(
                 sessions.items(),
@@ -313,10 +222,8 @@ def get_chat_sessions(collection):
         return []
 
 def restore_chat_session(session_messages):
-    """Convert chat session messages into proper message format."""
     restored_messages = []
     for message in session_messages:
-        # Split into question and answer
         parts = message.split('\nA: ')
         if len(parts) == 2:
             question = parts[0].replace('Q: ', '')
@@ -327,136 +234,232 @@ def restore_chat_session(session_messages):
             ])
     return restored_messages
 
-def process_text_for_context(text):
-    """Process input text into ChromaDB for context."""
-    try:
-        text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=1200,
-            chunk_overlap=100,
-            add_start_index=True
-        )
-        
-        splits = text_splitter.split_text(text)
-        
-        if not splits:
-            raise ValueError("No text chunks were created")
-
-        client = PersistentClient(path=CONTEXT_DIR)
-        collection = None
-        
-        try:
-            collection = client.get_collection(name="context_store")
-            collection.delete(where={})
-        except InvalidCollectionException:
-            collection = client.create_collection(
-                name="context_store",
-                metadata={"hnsw:space": "cosine"}
-            )
-        
-        # Add documents to collection
-        for i, chunk in enumerate(splits):
-            embedding = st.session_state.context_embeddings.embed_query(chunk)
-            collection.add(
-                documents=[chunk],
-                embeddings=[embedding],
-                metadatas=[{'type': 'context', 'chunk_id': i}],
-                ids=[f"ctx_{i}"]
-            )
-        
-        logging.info(f"Successfully created context store with {len(splits)} chunks")
-        return client, collection
-    except Exception as e:
-        logging.error(f"Error processing text: {str(e)}")
-        raise
-
-def get_context_from_collection(collection, embeddings, question, k=3):
-    """Retrieve relevant context from ChromaDB collection."""
-    try:
-        if not collection:
-            return ""
-            
-        query_embedding = embeddings.embed_query(question)
-        results = collection.query(
-            query_embeddings=[query_embedding],
-            n_results=k
-        )
-        
-        if results and 'documents' in results and results['documents']:
-            return ' '.join(results['documents'][0])
-        return ""
-    except Exception as e:
-        logging.error(f"Error retrieving context: {str(e)}")
-        return ""
-
-def stream_chat(model, messages, context=None):
-    """Stream chat responses with optional context enhancement."""
-    try:
-        llm = Ollama(model=model, request_timeout=120.0)
-        
-        if context and messages:
-            last_message = messages[-1]
-            enhanced_content = f"""Use this context to help answer the question, but also use your general knowledge:
-            Context: {context}
-            
-            Question: {last_message.content}"""
-            messages[-1] = ChatMessage(role=last_message.role, content=enhanced_content)
-        
-        resp = llm.stream_chat(messages)
-        response = ""
-        response_placeholder = st.empty()
-        for r in resp:
-            response += r.delta
-            response_placeholder.write(response)
-        logging.info(f"Model: {model}, Response: {response}")
-        return response
-    except Exception as e:
-        logging.error(f"Error during streaming: {str(e)}")
-        raise e
-
 def clear_chat_history():
-    """Clear all chat history from the database and reset session."""
     try:
         if st.session_state.chat_vectorstore:
-            # Delete all chat history entries
             try:
                 st.session_state.chat_vectorstore.delete(
                     where={"type": "chat_history"}
                 )
             except Exception as e:
                 logging.warning(f"Error with filtered delete: {str(e)}")
-                # Fallback: delete all entries
                 st.session_state.chat_vectorstore.delete()
             
-            # Reset session state
             st.session_state.messages = []
             st.session_state.current_session_id = None
             st.success("Chat history cleared successfully!")
             logging.info("Chat history cleared")
             
-            # Force refresh
             st.rerun()
     except Exception as e:
         st.error(f"Error clearing chat history: {str(e)}")
         logging.error(f"Error clearing chat history: {str(e)}")
 
-def main():
-    st.title("Enhanced Chat with LLMs")
-    logging.info("App started")
+def fetch_constitution():
+    url = "https://www.akorda.kz/en/constitution-of-the-republic-of-kazakhstan-50912"
+    try:
+        response = requests.get(url)
+        response.raise_for_status()
+        soup = BeautifulSoup(response.text, 'html.parser')
+        content = soup.find('main') or soup.find('article')
+        if not content:
+            logging.warning("Could not find main content section")
+            return ""
+        return content.get_text()
+    except Exception as e:
+        logging.error(f"Error fetching constitution: {str(e)}")
+        return ""
 
+def process_constitution_text(text):
+    try:
+        text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=500,
+            chunk_overlap=50,
+            separators=["\n\nArticle", "\n\nSection", "\n\n"],
+            add_start_index=True
+        )
+        
+        chunks = text_splitter.split_text(text)
+        if not chunks:
+            raise ValueError("No text chunks were created")
+        
+        client = PersistentClient(path=CONTEXT_DIR)
+        
+        try:
+            try:
+                collection = client.get_collection(name="constitution_store")
+                collection.delete(where={})
+                logging.info("Cleared existing constitution collection")
+            except Exception:
+                collection = client.create_collection(
+                    name="constitution_store",
+                    metadata={"hnsw:space": "cosine"}
+                )
+                logging.info("Created new constitution collection")
+            
+            for i, chunk in enumerate(chunks):
+                article_num = None
+                if "Article" in chunk:
+                    try:
+                        article_num = chunk.split("Article")[1].split()[0].rstrip('.')
+                    except:
+                        pass
+                    
+                embedding = st.session_state.embeddings.embed_query(chunk)
+                metadata = {
+                    'chunk_id': i,
+                    'article_number': article_num,
+                    'type': 'constitution'
+                }
+                
+                collection.add(
+                    documents=[chunk],
+                    embeddings=[embedding],
+                    metadatas=[metadata],
+                    ids=[f"const_{i}"]
+                )
+            
+            logging.info(f"Successfully processed {len(chunks)} constitution chunks")
+            return collection
+            
+        except Exception as e:
+            logging.error(f"Error with collection operations: {str(e)}")
+            raise
+            
+    except Exception as e:
+        logging.error(f"Error processing constitution: {str(e)}")
+        raise
+
+def get_relevant_articles(question, k=3):
+    try:
+        if not st.session_state.constitution_store:
+            logging.warning("Constitution store not initialized")
+            return "Constitution data is not available. Please try reloading the Constitution mode."
+            
+        query_embedding = st.session_state.embeddings.embed_query(question)
+        results = st.session_state.constitution_store.query(
+            query_embeddings=[query_embedding],
+            n_results=k
+        )
+        
+        if results and 'documents' in results and results['documents']:
+            contexts = []
+            for doc, metadata in zip(results['documents'][0], results['metadatas'][0]):
+                article_num = metadata.get('article_number', 'Section')
+                contexts.append(f"Article {article_num}:\n{doc}")
+            return '\n\n'.join(contexts)
+        return "No relevant articles found."
+    except Exception as e:
+        logging.error(f"Error retrieving articles: {str(e)}")
+        return f"An error occurred while retrieving articles: {str(e)}"
+
+def stream_chat(model, messages, mode="general", context=None):
+    try:
+        llm = Ollama(model=model, request_timeout=120.0)
+        
+        if messages:
+            last_message = messages[-1]
+            if mode == "constitution":
+                enhanced_content = f"""You are an AI assistant specialized in the Constitution of Kazakhstan. 
+                Always cite specific articles when answering questions.
+                
+                Relevant Constitutional Articles:
+                {context}
+                
+                Question: {last_message.content}
+                
+                Please provide a clear answer with specific article citations."""
+            else:
+                enhanced_content = f"""You are a helpful AI assistant. Use this context to help answer the question, but also use your general knowledge:
+                Context: {context}
+                
+                Question: {last_message.content}
+                
+                Please provide a clear and informative response."""
+            
+            messages[-1] = ChatMessage(role=last_message.role, content=enhanced_content)
+        
+        response = ""
+        response_placeholder = st.empty()
+        
+        for chunk in llm.stream_chat(messages):
+            response += chunk.delta
+            response_placeholder.write(response)
+            
+        return response
+    except Exception as e:
+        logging.error(f"Error during chat: {str(e)}")
+        raise
+
+def initialize_constitution_mode():
+    try:
+        if not st.session_state.constitution_loaded:
+            with st.spinner("Loading Constitution..."):
+                constitution_text = fetch_constitution()
+                if not constitution_text:
+                    st.error("Failed to fetch Constitution text. Please check your internet connection.")
+                    return False
+                
+                try:
+                    st.session_state.constitution_store = process_constitution_text(constitution_text)
+                    if st.session_state.constitution_store is None:
+                        raise ValueError("Failed to process Constitution text")
+                    st.session_state.constitution_loaded = True
+                    st.success("Constitution loaded successfully!")
+                    return True
+                except Exception as e:
+                    st.error(f"Error processing Constitution: {str(e)}")
+                    return False
+        return True
+    except Exception as e:
+        logging.error(f"Error in constitution mode initialization: {str(e)}")
+        st.error("Failed to initialize Constitution mode. Please try again.")
+        return False
+
+def main():
+    st.title("Multi-Mode AI Assistant")
+    
     # Initialize stores if not exists
     if st.session_state.chat_vectorstore is None:
         try:
             client, collection = initialize_chat_history_store()
-            st.session_state.chroma_client = client
             st.session_state.chat_vectorstore = collection
         except Exception as e:
             st.error(f"Failed to initialize chat history: {str(e)}")
             st.stop()
+    
+    # Assistant mode selection
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        if st.button("General Assistant", 
+                    type="primary" if st.session_state.assistant_mode == "general" else "secondary",
+                    key="general_button"):
+            st.session_state.assistant_mode = "general"
+            st.session_state.messages = []
+            st.rerun()
+            
+    with col2:
+        if st.button("Constitution Assistant", 
+                    type="primary" if st.session_state.assistant_mode == "constitution" else "secondary",
+                    key="constitution_button"):
+            st.session_state.assistant_mode = "constitution"
+            st.session_state.messages = []
+            if initialize_constitution_mode():
+                st.rerun()
 
-    # Sidebar configurations
+    # Display current mode
+    if st.session_state.assistant_mode:
+        st.markdown(f"**Current Mode:** {st.session_state.assistant_mode.title()} Assistant")
+        st.markdown("---")
+    else:
+        st.info("Please select an assistant mode above to begin.")
+        st.stop()
+
+    # Sidebar settings
     st.sidebar.title("Settings")
     model = st.sidebar.selectbox("Choose a model", ["llama3.2"])
-
+    
     # File upload section in sidebar
     st.sidebar.title("Document Upload")
     uploaded_files = st.sidebar.file_uploader(
@@ -538,10 +541,21 @@ def main():
         if session_container.button("Clear All History", key="clear_history"):
             clear_chat_history()
 
+    #Added code starts here
+    if st.session_state.assistant_mode == "constitution":
+        if st.sidebar.button("Reload Constitution Data"):
+            st.session_state.constitution_loaded = False
+            if initialize_constitution_mode():
+                st.success("Constitution data reloaded successfully!")
+            else:
+                st.error("Failed to reload Constitution data. Please try again.")
+    #Added code ends here
+
     # Chat interface
-    if prompt := st.chat_input("Your question"):
+    chat_placeholder = "Ask anything" if st.session_state.assistant_mode == "general" else "Ask about the Constitution of Kazakhstan"
+    
+    if prompt := st.chat_input(chat_placeholder):
         st.session_state.messages.append({"role": "user", "content": prompt})
-        logging.info(f"User input: {prompt}")
 
         # Display messages
         for message in st.session_state.messages:
@@ -551,52 +565,31 @@ def main():
         # Generate response
         if st.session_state.messages[-1]["role"] != "assistant":
             with st.chat_message("assistant"):
-                start_time = time.time()
-                logging.info("Generating response")
-
-                with st.spinner("Writing..."):
+                with st.spinner("Thinking..." if st.session_state.assistant_mode == "general" else "Researching Constitution..."):
                     try:
-                        # Combine context from knowledge base and uploaded documents
-                        context = []
+                        context = ""
+                        if st.session_state.assistant_mode == "constitution":
+                            context = get_relevant_articles(prompt)
+                        else:
+                            context = get_relevant_document_context(prompt)
                         
-                        if st.session_state.vectorstore is not None:
-                            kb_context = get_context_from_collection(
-                                st.session_state.vectorstore,
-                                st.session_state.context_embeddings,
-                                prompt
-                            )
-                            if kb_context:
-                                context.append(kb_context)
-                        
-                        # Get context from uploaded documents
-                        doc_context = get_relevant_document_context(prompt)
-                        if doc_context:
-                            context.append(doc_context)
-                        
-                        combined_context = "\n\n".join(context)
-
-                        # Generate response
                         messages = [ChatMessage(role=msg["role"], content=msg["content"]) 
                                   for msg in st.session_state.messages]
-                        response_message = stream_chat(model, messages, combined_context)
+                        response = stream_chat(model, messages, st.session_state.assistant_mode, context)
+                        
+                        st.session_state.messages.append({"role": "assistant", "content": response})
                         
                         # Store the interaction in chat history
                         session_id = store_chat_interaction(
                             st.session_state.chat_vectorstore,
                             st.session_state.embeddings,
                             prompt,
-                            response_message,
+                            response,
                             session_id=st.session_state.current_session_id
                         )
                         
                         if st.session_state.current_session_id is None:
                             st.session_state.current_session_id = session_id
-                        
-                        duration = time.time() - start_time
-                        response_message_with_duration = f"{response_message}\n\nDuration: {duration:.2f} seconds"
-                        st.session_state.messages.append({"role": "assistant", "content": response_message_with_duration})
-                        st.write(f"Duration: {duration:.2f} seconds")
-                        logging.info(f"Response generated, Duration: {duration:.2f} s")
 
                     except Exception as e:
                         st.error(f"An error occurred: {str(e)}")
@@ -604,3 +597,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
