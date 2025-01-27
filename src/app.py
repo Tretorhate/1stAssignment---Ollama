@@ -49,27 +49,56 @@ if 'constitution_loaded' not in st.session_state:
 
 # Helper functions
 
-def save_uploaded_file(uploaded_file):
-    try:
-        file_path = os.path.join(UPLOADS_DIR, uploaded_file.name)
-        with open(file_path, "wb") as f:
-            f.write(uploaded_file.getbuffer())
-        return file_path
-    except Exception as e:
-        logging.error(f"Error saving uploaded file: {str(e)}")
-        raise
+# def save_uploaded_file(uploaded_file):
+#     try:
+#         file_path = os.path.join(UPLOADS_DIR, uploaded_file.name)
+#         with open(file_path, "wb") as f:
+#             f.write(uploaded_file.getbuffer())
+#         return file_path
+#     except Exception as e:
+#         logging.error(f"Error saving uploaded file: {str(e)}")
+#         raise
 
-def process_uploaded_files(files):
+
+def initialize_document_store():
     try:
         client = PersistentClient(path=os.path.join(UPLOADS_DIR, "document_store"))
+        
+        # Try to get existing collection or create a new one
         try:
             collection = client.get_collection(name="document_store")
-            collection.delete(where={})
         except InvalidCollectionException:
             collection = client.create_collection(
                 name="document_store",
                 metadata={"hnsw:space": "cosine"}
             )
+        
+        # Assign to session state
+        st.session_state.document_store = collection
+        logging.info("Document store initialized.")
+    
+    except Exception as e:
+        logging.error(f"Error initializing document store: {str(e)}")
+        st.session_state.document_store = None  # Set to None if initialization fails
+
+# Call the function to initialize the document store at app start
+if 'document_store' not in st.session_state or st.session_state.document_store is None:
+    initialize_document_store()
+
+def process_uploaded_files(files):
+    """
+    Process uploaded files and store them in the existing Chroma collection with embeddings.
+    
+    Args:
+        files: List of uploaded files to process.
+        
+    Returns:
+        int: Number of files successfully processed.
+    """
+    try:
+        if st.session_state.document_store is None:
+            logging.error("Document store is not initialized. Cannot process files.")
+            return 0  # Return 0 since no files can be processed
 
         text_splitter = RecursiveCharacterTextSplitter(
             chunk_size=1200,
@@ -77,56 +106,116 @@ def process_uploaded_files(files):
             add_start_index=True
         )
 
+        processed_files = []
+
         for uploaded_file in files:
             if uploaded_file.type == "text/plain":
-                file_path = save_uploaded_file(uploaded_file)
-                with open(file_path, 'r') as f:
-                    content = f.read()
+                content = uploaded_file.getvalue().decode('utf-8')
                 
                 chunks = text_splitter.split_text(content)
+                
+                # Prepare documents, embeddings, and metadata for batch addition
+                documents = []
+                embeddings = []
+                metadatas = []
+                ids = []
                 
                 for i, chunk in enumerate(chunks):
                     embedding = st.session_state.embeddings.embed_query(chunk)
                     metadata = {
                         'source': uploaded_file.name,
                         'chunk_id': i,
-                        'type': 'document'
+                        'type': 'document',
+                        'total_chunks': len(chunks)
                     }
-                    collection.add(
-                        documents=[chunk],
-                        embeddings=[embedding],
-                        metadatas=[metadata],
-                        ids=[f"doc_{uploaded_file.name}_{i}"]
+                    documents.append(chunk)
+                    embeddings.append(embedding)
+                    metadatas.append(metadata)
+                    ids.append(f"doc_{uploaded_file.name}_{i}")
+                
+                # Add all chunks to the document store
+                if documents:
+                    st.session_state.document_store.add(
+                        documents=documents,
+                        embeddings=embeddings,
+                        metadatas=metadatas,
+                        ids=ids
                     )
+                
+                processed_files.append({
+                    'name': uploaded_file.name,
+                    'content_summary': content[:200] + '...' if len(content) > 200 else content
+                })
 
-        st.session_state.document_store = collection
+        # Store information about processed files in session state for later use
+        st.session_state.processed_files = processed_files
         return len(files)
+
     except Exception as e:
         logging.error(f"Error processing uploaded files: {str(e)}")
         raise
 
-def get_relevant_document_context(question, k=3):
+
+def get_relevant_document_context_multi_query(question, k=3):
     try:
-        if not st.session_state.document_store:
-            return ""
+        if st.session_state.document_store is None:
+            logging.error("Document store is not initialized.")
+            return "", [], []
 
-        query_embedding = st.session_state.embeddings.embed_query(question)
-        results = st.session_state.document_store.query(
-            query_embeddings=[query_embedding],
-            n_results=k,
-            where={"type": "document"}
-        )
+        llm = Ollama(model="llama3.2", request_timeout=360.0)
+        
+        # Generate queries
+        queries = generate_queries(llm, question)
+        logging.info(f"Queries in retrieval function: {queries}")
+        
+        chunk_scores = {}
+        retrieved_chunks = []
+        
+        for query in queries:
+            query_embedding = st.session_state.embeddings.embed_query(query)
+            
+            results = st.session_state.document_store.query(
+                query_embeddings=[query_embedding],
+                n_results=k,
+                where={"type": "document"}
+            )
+            
+            if results and 'documents' in results and results['documents']:
+                documents = results['documents'][0]
+                distances = results['distances'][0] if 'distances' in results else [1.0] * len(documents)
+                
+                for doc, score in zip(documents, distances):
+                    if doc not in chunk_scores:
+                        chunk_scores[doc] = score
+        
+        sorted_chunks = sorted(chunk_scores.items(), key=lambda x: x[1])[:k]
+        contexts = []
+        retrieved_info = []
+        
+        for chunk, score in sorted_chunks:
+            chunk_results = st.session_state.document_store.query(
+                query_embeddings=[st.session_state.embeddings.embed_query(chunk)],
+                n_results=1,
+                where={"type": "document"}
+            )
+            
+            source = "Unknown"
+            if chunk_results and 'metadatas' in chunk_results and chunk_results['metadatas']:
+                source = chunk_results['metadatas'][0][0].get('source', 'Unknown')
+            
+            contexts.append(f"From {source}:\n{chunk}")
+            retrieved_info.append({
+                'chunk': chunk,
+                'source': source,
+                'score': score
+            })
 
-        if results and 'documents' in results and results['documents']:
-            contexts = []
-            for doc, metadata in zip(results['documents'][0], results['metadatas'][0]):
-                source = metadata.get('source', 'Unknown')
-                contexts.append(f"From {source}:\n{doc}")
-            return '\n\n'.join(contexts)
-        return ""
+        # Return context, queries, and chunks separately
+        return '\n\n'.join(contexts), queries, retrieved_info
+
     except Exception as e:
         logging.error(f"Error retrieving document context: {str(e)}")
-        return ""
+        return "", [], []  # Return empty values in case of error
 
 def initialize_chat_history_store():
     try:
@@ -145,6 +234,55 @@ def initialize_chat_history_store():
     except Exception as e:
         logging.error(f"Error initializing chat history store: {str(e)}")
         raise
+
+def generate_queries(llm, user_question):
+    """Generate multiple perspective queries for a given user question."""
+    logging.info(f"Entering generate_queries with question: {user_question}")
+    try:
+        system_prompt = """You are a query generation assistant. Your task is to generate 3 alternative versions of a user's question to help with document retrieval. 
+        Each version should explore different aspects or phrasings of the question.
+        Return ONLY the 3 questions, one per line, with no additional text or explanation."""
+        
+        prompt = f"Original question: {user_question}\n\nGenerate 3 alternative versions of this question:"
+        
+        messages = [
+            ChatMessage(role="system", content=system_prompt),
+            ChatMessage(role="user", content=prompt)
+        ]
+        
+        st.write("Sending to LLM:", prompt)  # Visible in the app
+        response = llm.chat(messages)
+        
+        # Access the content directly from the response object
+        response_content = response.content if hasattr(response, 'content') else str(response)
+        logging.info(f"LLM Response Content: {response_content}")
+        
+        # Split and clean the response
+        generated_queries = [q.strip() for q in response_content.strip().split('\n') if q.strip()]
+        logging.info(f"Generated Queries: {generated_queries}")
+        
+        # Ensure we have the original question plus variants
+        all_queries = [user_question]
+        all_queries.extend(generated_queries)
+        
+        # Make sure we have at least the original question
+        if len(all_queries) == 1:
+            st.write("No additional queries generated, using variations of original")
+            all_queries.extend([
+                f"Tell me about {user_question}",
+                f"What information is available about {user_question}",
+                f"I want to know about {user_question}"
+            ])
+        
+        st.write("Final queries:", all_queries)  # Visible in the app
+        logging.info(f"Exiting generate_queries with queries: {all_queries}")
+        return all_queries
+        
+    except Exception as e:
+        logging.error(f"Error in generate_queries: {str(e)}")
+        st.error(f"Error in generate_queries: {str(e)}")
+        # Return at least the original question if there's an error
+        return [user_question]
 
 def store_chat_interaction(collection, embeddings, question, answer, session_id=None):
     try:
@@ -330,32 +468,61 @@ def process_constitution_text(text):
         logging.error(f"Error processing constitution: {str(e)}")
         raise
 
-def get_relevant_articles(question, k=3):
+def get_relevant_articles_multi_query(question, k=3):
+    """Retrieve relevant constitution articles using multiple query generation."""
     try:
         if not st.session_state.constitution_store:
             logging.warning("Constitution store not initialized")
             return "Constitution data is not available. Please try reloading the Constitution mode."
             
-        query_embedding = st.session_state.embeddings.embed_query(question)
-        results = st.session_state.constitution_store.query(
-            query_embeddings=[query_embedding],
-            n_results=k
-        )
+        # Initialize LLM for query generation
+        llm = Ollama(model="llama3.2", request_timeout=360.0)
         
-        if results and 'documents' in results and results['documents']:
-            contexts = []
-            for doc, metadata in zip(results['documents'][0], results['metadatas'][0]):
-                article_num = metadata.get('article_number', 'Section')
-                contexts.append(f"Article {article_num}:\n{doc}")
-            return '\n\n'.join(contexts)
-        return "No relevant articles found."
+        # Generate multiple queries
+        queries = generate_queries(llm, question)
+        
+        # Track all retrieved articles and their scores
+        article_scores = {}
+        
+        for query in queries:
+            query_embedding = st.session_state.embeddings.embed_query(query)
+            results = st.session_state.constitution_store.query(
+                query_embeddings=[query_embedding],
+                n_results=k
+            )
+            
+            if results and 'documents' in results and results['documents']:
+                documents = results['documents'][0]
+                metadatas = results['metadatas'][0]
+                distances = results['distances'][0] if 'distances' in results else [1.0] * len(documents)
+                
+                # Aggregate scores for each article
+                for doc, metadata, score in zip(documents, metadatas, distances):
+                    article_key = f"{metadata.get('article_number', 'Section')}:{doc}"
+                    if article_key not in article_scores:
+                        article_scores[article_key] = score
+                    else:
+                        # Take the best score (smallest distance)
+                        article_scores[article_key] = min(article_scores[article_key], score)
+        
+        # Sort articles by score and take top k
+        sorted_articles = sorted(article_scores.items(), key=lambda x: x[1])[:k]
+        
+        # Format context
+        contexts = []
+        for article_key, _ in sorted_articles:
+            article_num, content = article_key.split(':', 1)
+            contexts.append(f"Article {article_num}:\n{content}")
+            
+        return '\n\n'.join(contexts)
+        
     except Exception as e:
         logging.error(f"Error retrieving articles: {str(e)}")
         return f"An error occurred while retrieving articles: {str(e)}"
 
 def stream_chat(model, messages, mode="general", context=None):
     try:
-        llm = Ollama(model=model, request_timeout=120.0)
+        llm = Ollama(model=model, request_timeout=360.0)
         
         if messages:
             last_message = messages[-1]
@@ -419,6 +586,10 @@ def initialize_constitution_mode():
 def main():
     st.title("Multi-Mode AI Assistant")
     
+    # Ensure `queries` and `retrieval_info` are initialized at the very start
+    queries = []  
+    retrieval_info = []
+
     # Initialize stores if not exists
     if st.session_state.chat_vectorstore is None:
         try:
@@ -456,122 +627,124 @@ def main():
         st.info("Please select an assistant mode above to begin.")
         st.stop()
 
-    # Sidebar settings
-    st.sidebar.title("Settings")
-    model = st.sidebar.selectbox("Choose a model", ["llama3.2"])
-    
-    # File upload section in sidebar
-    st.sidebar.title("Document Upload")
-    uploaded_files = st.sidebar.file_uploader(
-        "Upload text documents",
-        type=['txt'],
-        accept_multiple_files=True
-    )
+    # Create three columns layout: sidebar (built-in), chat, and info panel
+    chat_col, info_col = st.columns([2, 1])
 
-    if uploaded_files:
-        if st.sidebar.button("Process Documents"):
-            with st.spinner("Processing documents..."):
-                try:
-                    num_files = process_uploaded_files(uploaded_files)
-                    st.success(f"Successfully processed {num_files} documents!")
-                except Exception as e:
-                    st.error(f"Error processing documents: {str(e)}")
+    with st.sidebar:
+        st.title("Settings")
+        model = st.selectbox("Choose a model", ["llama3.2"])
+        
+        # File upload section
+        st.title("Document Upload")
+        uploaded_files = st.file_uploader(
+            "Upload text documents",
+            type=['txt'],
+            accept_multiple_files=True
+        )
 
-    # Display uploaded files
-    if st.session_state.document_store:
-        st.sidebar.title("Uploaded Documents")
-        try:
-            results = st.session_state.document_store.get(
-                where={"type": "document"},
-                include=["metadatas"]
-            )
-            if results and results['metadatas']:
-                unique_sources = set(meta['source'] for meta in results['metadatas'])
-                st.sidebar.write("Available documents:")
-                for source in unique_sources:
-                    st.sidebar.text(f"📄 {source}")
-        except Exception as e:
-            st.sidebar.error(f"Error displaying documents: {str(e)}")
+        if uploaded_files:
+            if st.button("Process Documents"):
+                with st.spinner("Processing documents..."):
+                    try:
+                        num_files = process_uploaded_files(uploaded_files)
+                        st.success(f"Successfully processed {num_files} documents!")
+                    except Exception as e:
+                        st.error(f"Error processing documents: {str(e)}")
 
-    # Display previous conversation sessions
-    st.sidebar.title("Previous Conversations")
-    if st.session_state.chat_vectorstore is not None:
-        chat_sessions = get_chat_sessions(st.session_state.chat_vectorstore)
-        
-        session_container = st.sidebar.container()
-        
-        if session_container.button("Start New Chat", key="new_chat"):
-            st.session_state.messages = []
-            st.session_state.current_session_id = None
-            st.rerun()
-        
-        session_container.markdown("---")
-        
-        for session_id, session_data in chat_sessions:
+        # Display uploaded files
+        if st.session_state.document_store:
+            st.title("Uploaded Documents")
             try:
-                timestamp = datetime.fromisoformat(session_data['first_timestamp'])
-                formatted_time = timestamp.strftime("%Y-%m-%d %H:%M")
-                
-                preview = ""
-                if session_data['messages']:
-                    first_message = session_data['messages'][0]
-                    if "Q: " in first_message:
-                        preview = first_message.split("Q: ")[1].split("\nA:")[0]
-                        if len(preview) > 30:
-                            preview = preview[:30] + "..."
-                
-                button_key = f"session_{session_id}"
-                button_label = f"{formatted_time}\n{preview}"
-                
-                if session_container.button(
-                    button_label,
-                    key=button_key,
-                    help=f"Click to restore this conversation"
-                ):
-                    restored_messages = restore_chat_session(session_data['messages'])
-                    st.session_state.messages = restored_messages
-                    st.session_state.current_session_id = session_id
-                    st.rerun()
-                
+                results = st.session_state.document_store.get(
+                    where={"type": "document"},
+                    include=["metadatas"]
+                )
+                if results and results['metadatas']:
+                    unique_sources = set(meta['source'] for meta in results['metadatas'])
+                    st.write("Available documents:")
+                    for source in unique_sources:
+                        st.text(f"📄 {source}")
             except Exception as e:
-                logging.error(f"Error displaying session {session_id}: {str(e)}")
-                continue
-        
-        session_container.markdown("---")
-        if session_container.button("Clear All History", key="clear_history"):
-            clear_chat_history()
+                st.error(f"Error displaying documents: {str(e)}")
 
-    #Added code starts here
-    if st.session_state.assistant_mode == "constitution":
-        if st.sidebar.button("Reload Constitution Data"):
-            st.session_state.constitution_loaded = False
-            if initialize_constitution_mode():
-                st.success("Constitution data reloaded successfully!")
-            else:
-                st.error("Failed to reload Constitution data. Please try again.")
-    #Added code ends here
+        # Previous conversations section
+        st.title("Previous Conversations")
+        if st.session_state.chat_vectorstore is not None:
+            chat_sessions = get_chat_sessions(st.session_state.chat_vectorstore)
+            
+            session_container = st.container()
+            
+            if session_container.button("Start New Chat", key="new_chat"):
+                st.session_state.messages = []
+                st.session_state.current_session_id = None
+                st.rerun()
+            
+            session_container.markdown("---")
+            
+            for session_id, session_data in chat_sessions:
+                try:
+                    timestamp = datetime.fromisoformat(session_data['first_timestamp'])
+                    formatted_time = timestamp.strftime("%Y-%m-%d %H:%M")
+                    
+                    preview = ""
+                    if session_data['messages']:
+                        first_message = session_data['messages'][0]
+                        if "Q: " in first_message:
+                            preview = first_message.split("Q: ")[1].split("\nA:")[0]
+                            if len(preview) > 30:
+                                preview = preview[:30] + "..."
+                    
+                    button_key = f"session_{session_id}"
+                    button_label = f"{formatted_time}\n{preview}"
+                    
+                    if session_container.button(
+                        button_label,
+                        key=button_key,
+                        help=f"Click to restore this conversation"
+                    ):
+                        restored_messages = restore_chat_session(session_data['messages'])
+                        st.session_state.messages = restored_messages
+                        st.session_state.current_session_id = session_id
+                        st.rerun()
+                    
+                except Exception as e:
+                    logging.error(f"Error displaying session {session_id}: {str(e)}")
+                    continue
+            
+            session_container.markdown("---")
+            if session_container.button("Clear All History", key="clear_history"):
+                clear_chat_history()
 
-    # Chat interface
-    chat_placeholder = "Ask anything" if st.session_state.assistant_mode == "general" else "Ask about the Constitution of Kazakhstan"
-    
-    if prompt := st.chat_input(chat_placeholder):
-        st.session_state.messages.append({"role": "user", "content": prompt})
-
+    # Main chat interface in left column
+    with chat_col:
         # Display messages
         for message in st.session_state.messages:
             with st.chat_message(message["role"]):
                 st.write(message["content"])
 
-        # Generate response
-        if st.session_state.messages[-1]["role"] != "assistant":
+        # Chat input and response
+        chat_placeholder = "Ask anything" if st.session_state.assistant_mode == "general" else "Ask about the Constitution of Kazakhstan"
+        
+        if prompt := st.chat_input(chat_placeholder):
+            st.session_state.messages.append({"role": "user", "content": prompt})
+            
+            with st.chat_message("user"):
+                st.write(prompt)
+
+            # Generate response
             with st.chat_message("assistant"):
                 with st.spinner("Thinking..." if st.session_state.assistant_mode == "general" else "Researching Constitution..."):
                     try:
                         context = ""
+                        
                         if st.session_state.assistant_mode == "constitution":
-                            context = get_relevant_articles(prompt)
+                            context, queries, retrieval_info = get_relevant_articles_multi_query(prompt)
                         else:
-                            context = get_relevant_document_context(prompt)
+                            context, queries, retrieval_info = get_relevant_document_context_multi_query(prompt)
+                            logging.info(f"Retrieved all: {context, queries, retrieval_info}")
+                        
+                        # Add debug output
+                        st.write("Debug - Retrieval Info:", retrieval_info)
                         
                         messages = [ChatMessage(role=msg["role"], content=msg["content"]) 
                                   for msg in st.session_state.messages]
@@ -579,7 +752,7 @@ def main():
                         
                         st.session_state.messages.append({"role": "assistant", "content": response})
                         
-                        # Store the interaction in chat history
+                        # Store the interaction
                         session_id = store_chat_interaction(
                             st.session_state.chat_vectorstore,
                             st.session_state.embeddings,
@@ -594,6 +767,30 @@ def main():
                     except Exception as e:
                         st.error(f"An error occurred: {str(e)}")
                         logging.error(f"Error: {str(e)}")
+
+    # Info panel in right column
+    with info_col:
+        st.write("Debug - Current Mode:", st.session_state.assistant_mode)
+        
+        # Display the queries generated
+        if queries:
+            with st.expander("Generated Queries", expanded=True):
+                st.markdown("### Generated Queries")
+                for i, query in enumerate(queries, 1):
+                    st.markdown(f"**Query {i}:** {query}")
+        else:
+            st.warning("No queries generated.")
+
+
+        # Display retrieved chunks if available
+        if retrieval_info and 'chunks' in retrieval_info:
+            with st.expander("Retrieved Chunks", expanded=True):
+                st.markdown("### Retrieved Content")
+                for i, info in enumerate(retrieval_info['chunks'], 1):
+                    st.markdown(f"**Chunk {i}** (Source: {info['source']})")
+                    st.markdown(f"Relevance: {1 - info['score']:.3f}")
+                    st.text(info['chunk'])
+                    st.markdown("---")
 
 if __name__ == "__main__":
     main()
