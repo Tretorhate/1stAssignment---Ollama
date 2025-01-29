@@ -47,19 +47,6 @@ if 'assistant_mode' not in st.session_state:
 if 'constitution_loaded' not in st.session_state:
     st.session_state.constitution_loaded = False
 
-# Helper functions
-
-# def save_uploaded_file(uploaded_file):
-#     try:
-#         file_path = os.path.join(UPLOADS_DIR, uploaded_file.name)
-#         with open(file_path, "wb") as f:
-#             f.write(uploaded_file.getbuffer())
-#         return file_path
-#     except Exception as e:
-#         logging.error(f"Error saving uploaded file: {str(e)}")
-#         raise
-
-
 def initialize_document_store():
     try:
         client = PersistentClient(path=os.path.join(UPLOADS_DIR, "document_store"))
@@ -399,7 +386,7 @@ def fetch_constitution():
         response = requests.get(url)
         response.raise_for_status()
         soup = BeautifulSoup(response.text, 'html.parser')
-        content = soup.find('main') or soup.find('article')
+        content = soup.find('article')
         if not content:
             logging.warning("Could not find main content section")
             return ""
@@ -408,12 +395,13 @@ def fetch_constitution():
         logging.error(f"Error fetching constitution: {str(e)}")
         return ""
 
-def process_constitution_text(text):
+def process_constitution_text(text, clear_existing=False):
     try:
+        # Step 1: Split the text into chunks
         text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=500,
-            chunk_overlap=50,
-            separators=["\n\nArticle", "\n\nSection", "\n\n"],
+            chunk_size=150,
+            chunk_overlap=20,
+            separators=["\n\nSection", "\n\nArticle", "\n\n"],
             add_start_index=True
         )
         
@@ -424,10 +412,13 @@ def process_constitution_text(text):
         client = PersistentClient(path=CONTEXT_DIR)
         
         try:
+            # Step 2: Check if the collection exists
             try:
                 collection = client.get_collection(name="constitution_store")
-                collection.delete(where={})
-                logging.info("Cleared existing constitution collection")
+                logging.info("Found existing constitution collection")
+                if clear_existing:
+                    client.delete_collection(name="constitution_store")
+                    logging.info("Cleared existing constitution collection")
             except Exception:
                 collection = client.create_collection(
                     name="constitution_store",
@@ -435,13 +426,14 @@ def process_constitution_text(text):
                 )
                 logging.info("Created new constitution collection")
             
+            # Step 3: Add chunks to the collection
             for i, chunk in enumerate(chunks):
                 article_num = None
                 if "Article" in chunk:
                     try:
                         article_num = chunk.split("Article")[1].split()[0].rstrip('.')
-                    except:
-                        pass
+                    except Exception as e:
+                        logging.warning(f"Failed to parse article number: {str(e)}")
                     
                 embedding = st.session_state.embeddings.embed_query(chunk)
                 metadata = {
@@ -456,14 +448,18 @@ def process_constitution_text(text):
                     metadatas=[metadata],
                     ids=[f"const_{i}"]
                 )
+            with open("hello.txt", 'w', encoding='utf-8') as file:
+                for i, chunk in enumerate(chunks):
+                    file.write(f"--- Chunk {i + 1} ---\n")
+                    file.write(chunk + "\n\n")
             
             logging.info(f"Successfully processed {len(chunks)} constitution chunks")
             return collection
-            
+        
         except Exception as e:
             logging.error(f"Error with collection operations: {str(e)}")
             raise
-            
+    
     except Exception as e:
         logging.error(f"Error processing constitution: {str(e)}")
         raise
@@ -480,6 +476,8 @@ def get_relevant_articles_multi_query(question, k=3):
         
         # Generate multiple queries
         queries = generate_queries(llm, question)
+
+        retrieved_info = []
         
         # Track all retrieved articles and their scores
         article_scores = {}
@@ -513,8 +511,10 @@ def get_relevant_articles_multi_query(question, k=3):
         for article_key, _ in sorted_articles:
             article_num, content = article_key.split(':', 1)
             contexts.append(f"Article {article_num}:\n{content}")
+        with open("bye.txt", 'w', encoding='utf-8') as file:
+            file.write("\n\n".join([f"{k}: {v}" for k, v in sorted_articles]))
             
-        return '\n\n'.join(contexts)
+        return '\n\n'.join(contexts), queries, retrieved_info
         
     except Exception as e:
         logging.error(f"Error retrieving articles: {str(e)}")
@@ -535,7 +535,7 @@ def stream_chat(model, messages, mode="general", context=None):
                 
                 Question: {last_message.content}
                 
-                Please provide a clear answer with specific article citations."""
+                Please ignore the first paragraph of constitution, as it's not an article not section, just don't mention it. Please provide a clear answer with specific article citations."""
             else:
                 enhanced_content = f"""You are a helpful AI assistant. Use this context to help answer the question, but also use your general knowledge:
                 Context: {context}
@@ -794,4 +794,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
