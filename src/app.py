@@ -47,19 +47,6 @@ if 'assistant_mode' not in st.session_state:
 if 'constitution_loaded' not in st.session_state:
     st.session_state.constitution_loaded = False
 
-# Helper functions
-
-# def save_uploaded_file(uploaded_file):
-#     try:
-#         file_path = os.path.join(UPLOADS_DIR, uploaded_file.name)
-#         with open(file_path, "wb") as f:
-#             f.write(uploaded_file.getbuffer())
-#         return file_path
-#     except Exception as e:
-#         logging.error(f"Error saving uploaded file: {str(e)}")
-#         raise
-
-
 def initialize_document_store():
     try:
         client = PersistentClient(path=os.path.join(UPLOADS_DIR, "document_store"))
@@ -421,7 +408,7 @@ def fetch_constitution():
         response = requests.get(url)
         response.raise_for_status()
         soup = BeautifulSoup(response.text, 'html.parser')
-        content = soup.find('main') or soup.find('article')
+        content = soup.find('article')
         if not content:
             logging.warning("Could not find main content section")
             return ""
@@ -430,7 +417,7 @@ def fetch_constitution():
         logging.error(f"Error fetching constitution: {str(e)}")
         return ""
 
-def process_constitution_text(text):
+def process_constitution_text(text, clear_existing=False):
     try:
         # First split by articles to ensure clean article boundaries
         article_splitter = RecursiveCharacterTextSplitter(
@@ -508,11 +495,11 @@ def process_constitution_text(text):
             
             logging.info(f"Successfully processed {chunk_id} constitution chunks")
             return collection
-            
+        
         except Exception as e:
             logging.error(f"Error with collection operations: {str(e)}")
             raise
-            
+    
     except Exception as e:
         logging.error(f"Error processing constitution: {str(e)}")
         raise
@@ -529,6 +516,8 @@ def get_relevant_articles_multi_query(question, k=3):
         
         # Generate multiple queries
         queries = generate_queries(llm, question)
+
+        retrieved_info = []
         
         # Track complete articles and their scores
         article_scores = {}
