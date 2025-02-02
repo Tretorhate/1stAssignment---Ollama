@@ -168,54 +168,76 @@ def get_relevant_document_context_multi_query(question, k=3):
         queries = generate_queries(llm, question)
         logging.info(f"Queries in retrieval function: {queries}")
         
-        chunk_scores = {}
-        retrieved_chunks = []
+        # Track all retrieved chunks and their ranks
+        chunk_ranks = {}
+        constant = 60  # RRF constant
         
-        for query in queries:
+        # Store all unique documents and their metadata
+        doc_metadata = {}
+        
+        # Perform retrieval for each query
+        for query_idx, query in enumerate(queries):
             query_embedding = st.session_state.embeddings.embed_query(query)
             
             results = st.session_state.document_store.query(
                 query_embeddings=[query_embedding],
-                n_results=k,
+                n_results=k * 2,  # Retrieve more results initially for better fusion
                 where={"type": "document"}
             )
             
             if results and 'documents' in results and results['documents']:
                 documents = results['documents'][0]
-                distances = results['distances'][0] if 'distances' in results else [1.0] * len(documents)
+                metadatas = results['metadatas'][0]
                 
-                for doc, score in zip(documents, distances):
-                    if doc not in chunk_scores:
-                        chunk_scores[doc] = score
+                # Calculate RRF score for each document
+                for rank, (doc, metadata) in enumerate(zip(documents, metadatas), 1):
+                    # Store metadata for later use
+                    doc_metadata[doc] = metadata
+                    
+                    if doc not in chunk_ranks:
+                        chunk_ranks[doc] = 0
+                    # RRF formula: 1 / (rank + constant)
+                    rrf_score = 1 / (rank + constant)
+                    # Weight the first query slightly higher (original query)
+                    weight = 1.2 if query_idx == 0 else 1.0
+                    chunk_ranks[doc] += rrf_score * weight
         
-        sorted_chunks = sorted(chunk_scores.items(), key=lambda x: x[1])[:k]
+        # Sort chunks by their fused ranks
+        sorted_chunks = sorted(chunk_ranks.items(), key=lambda x: x[1], reverse=True)[:k]
+        
         contexts = []
         retrieved_info = []
         
         for chunk, score in sorted_chunks:
-            chunk_results = st.session_state.document_store.query(
-                query_embeddings=[st.session_state.embeddings.embed_query(chunk)],
-                n_results=1,
-                where={"type": "document"}
-            )
+            metadata = doc_metadata[chunk]
+            source = metadata.get('source', 'Unknown')
+            chunk_id = metadata.get('chunk_id', 'Unknown')
             
-            source = "Unknown"
-            if chunk_results and 'metadatas' in chunk_results and chunk_results['metadatas']:
-                source = chunk_results['metadatas'][0][0].get('source', 'Unknown')
+            # Format context with source information
+            context_entry = f"[Source: {source}, Chunk: {chunk_id}]\n{chunk}"
+            contexts.append(context_entry)
             
-            contexts.append(f"From {source}:\n{chunk}")
+            # Store detailed retrieval information
             retrieved_info.append({
                 'chunk': chunk,
                 'source': source,
-                'score': score
+                'chunk_id': chunk_id,
+                'rrf_score': score,
+                'metadata': metadata
             })
 
-        # Return context, queries, and chunks separately
-        return '\n\n'.join(contexts), queries, retrieved_info
+        # Join contexts with clear separators
+        final_context = '\n\n---\n\n'.join(contexts)
+        
+        # Log retrieval statistics
+        logging.info(f"Retrieved {len(sorted_chunks)} chunks from {len(queries)} queries")
+        logging.info(f"Top RRF score: {sorted_chunks[0][1] if sorted_chunks else 0}")
+
+        return final_context, queries, retrieved_info
 
     except Exception as e:
         logging.error(f"Error retrieving document context: {str(e)}")
-        return "", [], []  # Return empty values in case of error
+        return "", [], []
 
 def initialize_chat_history_store():
     try:
@@ -410,54 +432,81 @@ def fetch_constitution():
 
 def process_constitution_text(text):
     try:
-        text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=500,
-            chunk_overlap=50,
-            separators=["\n\nArticle", "\n\nSection", "\n\n"],
+        # First split by articles to ensure clean article boundaries
+        article_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=10000,  # Large size to avoid splitting mid-article
+            chunk_overlap=200,
+            separators=["\n\nArticle", "\nArticle", "Article"],
             add_start_index=True
         )
         
-        chunks = text_splitter.split_text(text)
-        if not chunks:
-            raise ValueError("No text chunks were created")
+        # Then split each article into smaller chunks if needed
+        text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=500,
+            chunk_overlap=50,
+            separators=["\n\n", "\n", ". "],
+            add_start_index=True
+        )
+        
+        # First split into article-level chunks
+        article_chunks = article_splitter.split_text(text)
         
         client = PersistentClient(path=CONTEXT_DIR)
         
         try:
+            # Try to get existing collection first
             try:
                 collection = client.get_collection(name="constitution_store")
-                collection.delete(where={})
-                logging.info("Cleared existing constitution collection")
-            except Exception:
+            except InvalidCollectionException:
                 collection = client.create_collection(
                     name="constitution_store",
                     metadata={"hnsw:space": "cosine"}
                 )
                 logging.info("Created new constitution collection")
             
-            for i, chunk in enumerate(chunks):
+            # Clear existing data
+            existing_data = collection.get()
+            if existing_data and 'ids' in existing_data and existing_data['ids']:
+                collection.delete(ids=existing_data['ids'])
+                logging.info("Cleared existing constitution collection")
+            
+            chunk_id = 0
+            for article_chunk in article_chunks:
+                # Extract article number
                 article_num = None
-                if "Article" in chunk:
+                if "Article" in article_chunk:
                     try:
-                        article_num = chunk.split("Article")[1].split()[0].rstrip('.')
+                        article_num = article_chunk.split("Article")[1].split()[0].rstrip('.')
                     except:
                         pass
-                    
-                embedding = st.session_state.embeddings.embed_query(chunk)
-                metadata = {
-                    'chunk_id': i,
-                    'article_number': article_num,
-                    'type': 'constitution'
-                }
                 
-                collection.add(
-                    documents=[chunk],
-                    embeddings=[embedding],
-                    metadatas=[metadata],
-                    ids=[f"const_{i}"]
-                )
+                # Split large articles into smaller chunks
+                if len(article_chunk) > 500:
+                    sub_chunks = text_splitter.split_text(article_chunk)
+                else:
+                    sub_chunks = [article_chunk]
+                
+                # Process each sub-chunk
+                for i, chunk in enumerate(sub_chunks):
+                    embedding = st.session_state.embeddings.embed_query(chunk)
+                    metadata = {
+                        'chunk_id': chunk_id,
+                        'article_number': article_num,
+                        'sub_chunk': i,
+                        'total_sub_chunks': len(sub_chunks),
+                        'type': 'constitution',
+                        'full_article': article_chunk  # Store the complete article text
+                    }
+                    
+                    collection.add(
+                        documents=[chunk],
+                        embeddings=[embedding],
+                        metadatas=[metadata],
+                        ids=[f"const_{chunk_id}"]
+                    )
+                    chunk_id += 1
             
-            logging.info(f"Successfully processed {len(chunks)} constitution chunks")
+            logging.info(f"Successfully processed {chunk_id} constitution chunks")
             return collection
             
         except Exception as e:
@@ -473,7 +522,7 @@ def get_relevant_articles_multi_query(question, k=3):
     try:
         if not st.session_state.constitution_store:
             logging.warning("Constitution store not initialized")
-            return "Constitution data is not available. Please try reloading the Constitution mode."
+            return "", [], []  # Return empty context, queries, and retrieval info
             
         # Initialize LLM for query generation
         llm = Ollama(model="llama3.2", request_timeout=360.0)
@@ -481,14 +530,16 @@ def get_relevant_articles_multi_query(question, k=3):
         # Generate multiple queries
         queries = generate_queries(llm, question)
         
-        # Track all retrieved articles and their scores
+        # Track complete articles and their scores
         article_scores = {}
+        retrieval_info = []
         
         for query in queries:
             query_embedding = st.session_state.embeddings.embed_query(query)
+            
             results = st.session_state.constitution_store.query(
                 query_embeddings=[query_embedding],
-                n_results=k
+                n_results=k * 2  # Get more results initially for better coverage
             )
             
             if results and 'documents' in results and results['documents']:
@@ -496,29 +547,50 @@ def get_relevant_articles_multi_query(question, k=3):
                 metadatas = results['metadatas'][0]
                 distances = results['distances'][0] if 'distances' in results else [1.0] * len(documents)
                 
-                # Aggregate scores for each article
                 for doc, metadata, score in zip(documents, metadatas, distances):
-                    article_key = f"{metadata.get('article_number', 'Section')}:{doc}"
+                    article_num = metadata.get('article_number')
+                    if not article_num:
+                        continue
+                        
+                    # Use the full article text if available
+                    full_article = metadata.get('full_article', doc)
+                    article_key = f"{article_num}:{full_article}"
+                    
                     if article_key not in article_scores:
                         article_scores[article_key] = score
+                        retrieval_info.append({
+                            'chunk': full_article,
+                            'article_number': article_num,
+                            'score': score,
+                            'metadata': metadata
+                        })
                     else:
-                        # Take the best score (smallest distance)
+                        # Take the best score
                         article_scores[article_key] = min(article_scores[article_key], score)
         
+        if not article_scores:
+            return "No relevant articles found in the constitution. Please try rephrasing your question.", queries, []
+            
         # Sort articles by score and take top k
         sorted_articles = sorted(article_scores.items(), key=lambda x: x[1])[:k]
         
-        # Format context
+        # Format context with clear article separation
         contexts = []
         for article_key, _ in sorted_articles:
             article_num, content = article_key.split(':', 1)
-            contexts.append(f"Article {article_num}:\n{content}")
+            contexts.append(f"Article {article_num}:\n{content.strip()}")
             
-        return '\n\n'.join(contexts)
+        final_context = "\n\n---\n\n".join(contexts)
+        
+        # Add debug information
+        logging.info(f"Retrieved {len(sorted_articles)} articles")
+        logging.info(f"Articles: {[key.split(':')[0] for key, _ in sorted_articles]}")
+        
+        return final_context, queries, retrieval_info
         
     except Exception as e:
         logging.error(f"Error retrieving articles: {str(e)}")
-        return f"An error occurred while retrieving articles: {str(e)}"
+        return f"An error occurred while retrieving articles: {str(e)}", [], []
 
 def stream_chat(model, messages, mode="general", context=None):
     try:
@@ -535,14 +607,14 @@ def stream_chat(model, messages, mode="general", context=None):
                 
                 Question: {last_message.content}
                 
-                Please provide a clear answer with specific article citations."""
+                Please provide a clear answer with specific article citations, using the information provided above."""
             else:
                 enhanced_content = f"""You are a helpful AI assistant. Use this context to help answer the question, but also use your general knowledge:
                 Context: {context}
                 
                 Question: {last_message.content}
                 
-                Please provide a clear and informative response."""
+                Please provide a clear and informative response, incorporating the context provided."""
             
             messages[-1] = ChatMessage(role=last_message.role, content=enhanced_content)
         
@@ -783,15 +855,14 @@ def main():
 
 
         # Display retrieved chunks if available
-        if retrieval_info and 'chunks' in retrieval_info:
-            with st.expander("Retrieved Chunks", expanded=True):
-                st.markdown("### Retrieved Content")
-                for i, info in enumerate(retrieval_info['chunks'], 1):
-                    st.markdown(f"**Chunk {i}** (Source: {info['source']})")
-                    st.markdown(f"Relevance: {1 - info['score']:.3f}")
-                    st.text(info['chunk'])
-                    st.markdown("---")
+        # if retrieval_info and 'chunks' in retrieval_info:
+        #     with st.expander("Retrieved Chunks", expanded=True):
+        #         st.markdown("### Retrieved Content")
+        #         for i, info in enumerate(retrieval_info['chunks'], 1):
+        #             st.markdown(f"**Chunk {i}** (Source: {info['source']})")
+        #             st.markdown(f"Relevance: {1 - info['score']:.3f}")
+        #             st.text(info['chunk'])
+        #             st.markdown("---")
 
 if __name__ == "__main__":
     main()
-
