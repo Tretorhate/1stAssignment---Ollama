@@ -408,7 +408,7 @@ def fetch_constitution():
         response = requests.get(url)
         response.raise_for_status()
         soup = BeautifulSoup(response.text, 'html.parser')
-        content = soup.find('article')
+        content = soup.find('main') or soup.find('article')
         if not content:
             logging.warning("Could not find main content section")
             return ""
@@ -417,7 +417,7 @@ def fetch_constitution():
         logging.error(f"Error fetching constitution: {str(e)}")
         return ""
 
-def process_constitution_text(text, clear_existing=False):
+def process_constitution_text(text):
     try:
         # First split by articles to ensure clean article boundaries
         article_splitter = RecursiveCharacterTextSplitter(
@@ -495,11 +495,11 @@ def process_constitution_text(text, clear_existing=False):
             
             logging.info(f"Successfully processed {chunk_id} constitution chunks")
             return collection
-        
+            
         except Exception as e:
             logging.error(f"Error with collection operations: {str(e)}")
             raise
-    
+            
     except Exception as e:
         logging.error(f"Error processing constitution: {str(e)}")
         raise
@@ -516,8 +516,6 @@ def get_relevant_articles_multi_query(question, k=3):
         
         # Generate multiple queries
         queries = generate_queries(llm, question)
-
-        retrieved_info = []
         
         # Track complete articles and their scores
         article_scores = {}
@@ -841,17 +839,6 @@ def main():
                     st.markdown(f"**Query {i}:** {query}")
         else:
             st.warning("No queries generated.")
-
-
-        # Display retrieved chunks if available
-        # if retrieval_info and 'chunks' in retrieval_info:
-        #     with st.expander("Retrieved Chunks", expanded=True):
-        #         st.markdown("### Retrieved Content")
-        #         for i, info in enumerate(retrieval_info['chunks'], 1):
-        #             st.markdown(f"**Chunk {i}** (Source: {info['source']})")
-        #             st.markdown(f"Relevance: {1 - info['score']:.3f}")
-        #             st.text(info['chunk'])
-        #             st.markdown("---")
 
 if __name__ == "__main__":
     main()
