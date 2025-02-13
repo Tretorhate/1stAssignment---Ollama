@@ -670,6 +670,37 @@ def initialize_constitution_mode():
         st.error("Failed to initialize Constitution mode. Please try again.")
         return False
 
+def delete_document(source_name):
+    """
+    Delete all chunks associated with a specific document source.
+    
+    Args:
+        source_name: Name of the document to delete
+    
+    Returns:
+        bool: True if successful, False otherwise
+    """
+    try:
+        if st.session_state.document_store is None:
+            logging.error("Document store is not initialized")
+            return False
+
+        # Get all documents with matching source
+        results = st.session_state.document_store.get(
+            where={"source": source_name}
+        )
+        
+        if results and 'ids' in results and results['ids']:
+            st.session_state.document_store.delete(
+                ids=results['ids']
+            )
+            logging.info(f"Successfully deleted document: {source_name}")
+            return True
+        return False
+    except Exception as e:
+        logging.error(f"Error deleting document: {str(e)}")
+        return False
+
 def main():
     st.title("Multi-Mode AI Assistant")
     
@@ -738,7 +769,7 @@ def main():
                     except Exception as e:
                         st.error(f"Error processing documents: {str(e)}")
 
-        # Display uploaded files
+        # Display uploaded documents
         if st.session_state.document_store:
             st.title("Uploaded Documents")
             try:
@@ -750,7 +781,14 @@ def main():
                     unique_sources = set(meta['source'] for meta in results['metadatas'])
                     st.write("Available documents:")
                     for source in unique_sources:
-                        st.text(f"📄 {source}")
+                        col1, col2 = st.columns([3, 1])
+                        col1.text(f"📄 {source}")
+                        if col2.button("🗑️", key=f"delete_{source}", help=f"Delete {source}"):
+                            if delete_document(source):
+                                st.success(f"Deleted {source}")
+                                st.rerun()
+                            else:
+                                st.error(f"Failed to delete {source}")
             except Exception as e:
                 st.error(f"Error displaying documents: {str(e)}")
 
