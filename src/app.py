@@ -432,29 +432,26 @@ def fetch_constitution():
 
 def process_constitution_text(text):
     try:
-        # First split by articles to ensure clean article boundaries
-        article_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=10000,  # Large size to avoid splitting mid-article
-            chunk_overlap=200,
-            separators=["\n\nArticle", "\nArticle", "Article"],
-            add_start_index=True
-        )
+        # First clean and normalize the text
+        text = text.replace('\r\n', '\n').strip()
         
-        # Then split each article into smaller chunks if needed
-        text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=500,
-            chunk_overlap=50,
-            separators=["\n\n", "\n", ". "],
-            add_start_index=True
-        )
-        
-        # First split into article-level chunks
-        article_chunks = article_splitter.split_text(text)
+        # Split into initial article chunks using article markers
+        raw_articles = []
+        current_article = []
+        for line in text.split('\n'):
+            if line.strip().startswith('Article'):
+                if current_article:
+                    raw_articles.append('\n'.join(current_article))
+                current_article = [line]
+            elif current_article:
+                current_article.append(line)
+        if current_article:
+            raw_articles.append('\n'.join(current_article))
         
         client = PersistentClient(path=CONTEXT_DIR)
         
         try:
-            # Try to get existing collection first
+            # Get or create collection
             try:
                 collection = client.get_collection(name="constitution_store")
             except InvalidCollectionException:
@@ -462,32 +459,47 @@ def process_constitution_text(text):
                     name="constitution_store",
                     metadata={"hnsw:space": "cosine"}
                 )
-                logging.info("Created new constitution collection")
             
             # Clear existing data
             existing_data = collection.get()
             if existing_data and 'ids' in existing_data and existing_data['ids']:
                 collection.delete(ids=existing_data['ids'])
-                logging.info("Cleared existing constitution collection")
             
+            # Process each article
             chunk_id = 0
-            for article_chunk in article_chunks:
+            for article in raw_articles:
+                if not article.strip():
+                    continue
+                    
                 # Extract article number
                 article_num = None
-                if "Article" in article_chunk:
+                if "Article" in article:
                     try:
-                        article_num = article_chunk.split("Article")[1].split()[0].rstrip('.')
+                        article_num = article.split("Article")[1].split()[0].rstrip('.')
+                        logging.info(f"Processing Article {article_num}")
                     except:
-                        pass
+                        logging.warning("Could not extract article number")
+                        continue
                 
-                # Split large articles into smaller chunks
-                if len(article_chunk) > 500:
-                    sub_chunks = text_splitter.split_text(article_chunk)
+                # Create smaller chunks if article is long
+                if len(article) > 500:
+                    # Split while preserving sentence boundaries
+                    chunk_text_splitter = RecursiveCharacterTextSplitter(
+                        chunk_size=400,  # Smaller chunk size
+                        chunk_overlap=50,
+                        separators=["\n\n", "\n", ". ", "? ", "! "],  # Respect sentence boundaries
+                        add_start_index=True
+                    )
+                    sub_chunks = chunk_text_splitter.split_text(article)
                 else:
-                    sub_chunks = [article_chunk]
+                    sub_chunks = [article]
                 
                 # Process each sub-chunk
                 for i, chunk in enumerate(sub_chunks):
+                    # Ensure each chunk starts with article reference if it's not there
+                    if not chunk.strip().startswith('Article'):
+                        chunk = f"Article {article_num} (continued):\n{chunk}"
+                    
                     embedding = st.session_state.embeddings.embed_query(chunk)
                     metadata = {
                         'chunk_id': chunk_id,
@@ -495,16 +507,19 @@ def process_constitution_text(text):
                         'sub_chunk': i,
                         'total_sub_chunks': len(sub_chunks),
                         'type': 'constitution',
-                        'full_article': article_chunk  # Store the complete article text
+                        'full_article': article,  # Store complete article text
+                        'is_continuation': i > 0  # Flag if this is a continuation chunk
                     }
                     
                     collection.add(
                         documents=[chunk],
                         embeddings=[embedding],
                         metadatas=[metadata],
-                        ids=[f"const_{chunk_id}"]
+                        ids=[f"const_{article_num}_{i}"]
                     )
                     chunk_id += 1
+                    
+                logging.info(f"Article {article_num} split into {len(sub_chunks)} chunks")
             
             logging.info(f"Successfully processed {chunk_id} constitution chunks")
             return collection
