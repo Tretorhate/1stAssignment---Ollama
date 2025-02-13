@@ -13,6 +13,8 @@ This project provides a web-based interface for enhanced interactions with Large
 - Ability to restore previous chat sessions.
 - Interactive interface built with Streamlit.
 - Flexible LLM selection and contextual processing.
+- Constitutional assistant.
+- Multiquery retrieving.
 
 ---
 
@@ -69,6 +71,7 @@ Ensure you have the following installed on your system:
 2. **Context Management:** Paste any relevant context information in the sidebar and click "Process Context" to include it in your responses.
 3. **Previous Conversations:** View and restore past sessions from the sidebar.
 4. **Clear History:** Clear all chat history from the database via the sidebar option.
+5. **Two Mods:** General and Constitutional Assistants
 
 ### Sidebar Options
 
